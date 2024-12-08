@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -124,6 +126,16 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 
 	chairLocationID := ulid.Make().String()
 	now := time.Now()
+	if err := insertChairLocation(ctx, tx, ChairLocation{
+		ID:        chairLocationID,
+		ChairID:   chair.ID,
+		Latitude:  req.Latitude,
+		Longitude: req.Longitude,
+		CreatedAt: now,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
@@ -190,6 +202,38 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
 		RecordedAt: location.CreatedAt.UnixMilli(),
 	})
+}
+
+var (
+	g                    singleflight.Group
+	chairLocationQueue   []ChairLocation
+	muChairLocationQueue sync.Mutex
+)
+
+func insertChairLocation(ctx context.Context, tx *sqlx.Tx, data ChairLocation) error {
+	_, err, _ := g.Do("chair_locations", func() (interface{}, error) {
+		muChairLocationQueue.Lock()
+		exists := len(chairLocationQueue) > 0
+		chairLocationQueue = append(chairLocationQueue, data)
+		muChairLocationQueue.Unlock()
+
+		if exists {
+			return nil
+		}
+
+		time.Sleep(time.Secound * 2)
+		muChairLocationQueue.Lock()
+		records := chairLocationQueue[:]
+		chairLocationQueue = make([]ChairLocation, 0)
+		muChairLocationQueue.Unlock()
+		tx.ExecContext(
+			ctx,
+			`INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
+			chairLocationID, chair.ID, req.Latitude, req.Longitude, now,
+		)
+		return nil
+	})
+	return err
 }
 
 type simpleUser struct {
